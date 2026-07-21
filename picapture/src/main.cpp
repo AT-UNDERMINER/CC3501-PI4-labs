@@ -60,9 +60,6 @@ int main()
             break;
         }
 
-        // show frame
-        cv::imshow("Camera", frame);
-
         // Threshold + morphology
         cv::cvtColor(frame, hsv_frame, cv::COLOR_BGR2HSV);
 
@@ -78,20 +75,55 @@ int main()
 
         cv::imshow("Thresholded", thresh_frame);
 
-        // --- Stage 3: centre of mass ---
-        // moments() treats white (255) pixels in the mask as "mass" and gives
-        // us weighted sums we can turn into a centroid position.
-        cv::Moments m = cv::moments(thresh_frame, true);
+        // --- Extension: find contours, keep only the largest ---
+        // findContours needs a non-const copy of the mask to work on, and it
+        // modifies it in place - thresh_frame is already ours to use since we
+        // just displayed it above, so this is safe.
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(thresh_frame, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-        // m00 is the total white pixel "mass". If it's 0, nothing was
-        // detected in the mask, so there's no valid centroid to compute -
-        // skip printing rather than dividing by zero.
-        if (m.m00 > 0) {
-            double cx = m.m10 / m.m00;
-            double cy = m.m01 / m.m00;
-            printf("Centre of mass: (%.1f, %.1f)\n", cx, cy);
+        // Find the largest contour by area. Small contours are usually just
+        // leftover noise that survived the morphology step; the real object
+        // (the can) should be the biggest blob in the mask.
+        int largestIdx = -1;
+        double largestArea = 0.0;
+        for (size_t i = 0; i < contours.size(); i++) {
+            double area = cv::contourArea(contours[i]);
+            if (area > largestArea) {
+                largestArea = area;
+                largestIdx = (int)i;
+            }
         }
-        // --- end Stage 3 ---
+
+        // Draw on a clone of the original frame so we don't permanently mark
+        // up the same Mat we're about to loop back and re-read next frame.
+        cv::Mat display_frame = frame.clone();
+
+        if (largestIdx >= 0) {
+            // Draw the outline of just the largest contour, in white, 2px thick.
+            cv::drawContours(display_frame, contours, largestIdx,
+                              cv::Scalar(255, 255, 255), 2);
+
+            // Compute centre of mass from the largest contour only (rather than
+            // the whole mask), so leftover noise elsewhere in frame can't drag
+            // the centroid off target.
+            cv::Moments m = cv::moments(contours[largestIdx]);
+            if (m.m00 > 0) {
+                double cx = m.m10 / m.m00;
+                double cy = m.m01 / m.m00;
+
+                printf("Centre of mass: (%.1f, %.1f)\n", cx, cy);
+
+                // Write the coordinates onto the image near the centroid.
+                char text[64];
+                snprintf(text, sizeof(text), "(%.1f, %.1f)", cx, cy);
+                cv::putText(display_frame, text, cv::Point((int)cx + 10, (int)cy),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+            }
+        }
+
+        cv::imshow("Camera", display_frame);
+        // --- end Extension ---
 
         cv::waitKey(1);
 
