@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.12)
+project(Lab8Client)
+set(CMAKE_CXX_STANDARD 20)
+add_compile_options(-O2 -Wall)
+find_package(CURL REQUIRED)
+add_executable(lab8_client src/lab8_client.cpp)
+target_link_libraries(lab8_client CURL::libcurl)
