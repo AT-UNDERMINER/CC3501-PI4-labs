@@ -1,144 +1,259 @@
+// Lab 7: real time colour object detection with OpenCV.
+//
+// Captures live frames from the Raspberry Pi camera, thresholds them in HSV
+// colour space, cleans up the result with morphological open and close, then
+// reports the centre of mass of the largest detected object.
+//
+// All detection parameters are adjustable at run time using the sliders in the
+// "Control" window. Press Escape or q to quit.
+
 #include <opencv2/opencv.hpp>
 #include <sys/time.h>
 
+// The camera captures at a higher resolution than we process. Downsampling
+// after capture keeps the full field of view while making each frame much
+// cheaper to process on the Pi.
+const int CAPTURE_WIDTH = 800;
+const int CAPTURE_HEIGHT = 600;
+const int PROCESS_WIDTH = 400;
+const int PROCESS_HEIGHT = 300;
+
+// Slider limits. Hue in OpenCV runs 0 to 179, the other channels 0 to 255.
+const int HUE_MAX = 179;
+const int CHANNEL_MAX = 255;
+const int KERNEL_HALF_MAX = 20;
+const int MIN_AREA_MAX = 5000;
+
+// Number of frames to time before reporting the frame rate.
+const int FRAME_RATE_INTERVAL = 30;
+
+// Appearance of the detection overlay.
+const cv::Scalar OVERLAY_COLOUR(255, 255, 255);
+const int OUTLINE_THICKNESS = 2;
+const double LABEL_SCALE = 0.5;
+const int LABEL_OFFSET = 10;
+
+const std::string CAMERA_WINDOW = "Camera";
+const std::string THRESHOLD_WINDOW = "Thresholded";
+const std::string CONTROL_WINDOW = "Control";
+
+// Detection parameters, all controlled by the sliders.
+struct DetectionParams {
+    int low_hue = 0;
+    int high_hue = HUE_MAX;
+    int low_saturation = 0;
+    int high_saturation = CHANNEL_MAX;
+    int low_value = 0;
+    int high_value = CHANNEL_MAX;
+
+    // Half the width of the structuring element. getStructuringElement needs an
+    // odd size, so the full size used is 2 * kernel_half_size + 1.
+    int kernel_half_size = 3;
+
+    // Contours smaller than this are treated as leftover noise and ignored.
+    int min_area = 100;
+};
+
+// Times how long each block of frames takes so the frame rate can be reported.
+struct FrameRateMonitor {
+    timeval start;
+    int frame_count = 0;
+
+    void begin()
+    {
+        frame_count = 0;
+        gettimeofday(&start, NULL);
+    }
+
+    // Counts one frame, printing the average rate once a full block is done.
+    void tick()
+    {
+        frame_count++;
+        if (frame_count < FRAME_RATE_INTERVAL) {
+            return;
+        }
+
+        timeval end;
+        gettimeofday(&end, NULL);
+        double seconds = (end.tv_sec - start.tv_sec) +
+                         (end.tv_usec - start.tv_usec) / 1000000.0;
+        printf("%d frames in %.3f seconds = %.1f FPS\n",
+               frame_count, seconds, frame_count / seconds);
+
+        begin();
+    }
+};
+
+// Builds the gstreamer pipeline used to read frames from the Pi camera.
+std::string build_pipeline()
+{
+    return "libcamerasrc"
+           " ! video/x-raw, width=" + std::to_string(CAPTURE_WIDTH) +
+           ", height=" + std::to_string(CAPTURE_HEIGHT) +
+           " ! videoconvert"
+           " ! videoscale"
+           " ! video/x-raw, width=" + std::to_string(PROCESS_WIDTH) +
+           ", height=" + std::to_string(PROCESS_HEIGHT) +
+           " ! videoflip method=rotate-180" // remove this line if the image is upside-down
+           " ! appsink drop=true max_buffers=2";
+}
+
+// Creates the window of sliders used to tune the detection while it runs.
+void create_control_window(DetectionParams &params)
+{
+    cv::namedWindow(CONTROL_WINDOW, cv::WINDOW_AUTOSIZE);
+
+    cv::createTrackbar("LowH", CONTROL_WINDOW, &params.low_hue, HUE_MAX);
+    cv::createTrackbar("HighH", CONTROL_WINDOW, &params.high_hue, HUE_MAX);
+
+    cv::createTrackbar("LowS", CONTROL_WINDOW, &params.low_saturation, CHANNEL_MAX);
+    cv::createTrackbar("HighS", CONTROL_WINDOW, &params.high_saturation, CHANNEL_MAX);
+
+    cv::createTrackbar("LowV", CONTROL_WINDOW, &params.low_value, CHANNEL_MAX);
+    cv::createTrackbar("HighV", CONTROL_WINDOW, &params.high_value, CHANNEL_MAX);
+
+    cv::createTrackbar("Kernel Size", CONTROL_WINDOW, &params.kernel_half_size, KERNEL_HALF_MAX);
+    cv::createTrackbar("Min Area", CONTROL_WINDOW, &params.min_area, MIN_AREA_MAX);
+}
+
+// Converts the frame to HSV, thresholds it against the slider values, then
+// applies morphological open and close to tidy up the result.
+//
+// The HSV buffer is passed in rather than declared locally so that it is
+// reused between frames instead of being reallocated every time.
+void threshold_image(const cv::Mat &frame, const DetectionParams &params,
+                     cv::Mat &hsv, cv::Mat &mask)
+{
+    cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
+    cv::inRange(hsv,
+                cv::Scalar(params.low_hue, params.low_saturation, params.low_value),
+                cv::Scalar(params.high_hue, params.high_saturation, params.high_value),
+                mask);
+
+    int kernel_size = params.kernel_half_size * 2 + 1;
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
+                                               cv::Size(kernel_size, kernel_size));
+
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);  // removes speckles in the background
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel); // fills small holes in the object
+}
+
+// Finds the objects in the thresholded mask. Contours smaller than min_area are
+// discarded as noise, and the index of the largest object that remains is
+// returned, or -1 if nothing was detected.
+int find_objects(const cv::Mat &mask, std::vector<std::vector<cv::Point>> &objects,
+                 double min_area)
+{
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    objects.clear();
+    int largest_index = -1;
+    double largest_area = 0;
+
+    for (const auto &contour : contours) {
+        double area = cv::contourArea(contour);
+        if (area < min_area) {
+            continue;
+        }
+
+        if (area > largest_area) {
+            largest_area = area;
+            largest_index = static_cast<int>(objects.size());
+        }
+        objects.push_back(contour);
+    }
+
+    return largest_index;
+}
+
+// Calculates the centre of mass of a contour from its image moments. Returns
+// false if the contour encloses no area.
+bool centre_of_mass(const std::vector<cv::Point> &contour, cv::Point2d &centre)
+{
+    cv::Moments moments = cv::moments(contour);
+    if (moments.m00 <= 0) {
+        return false;
+    }
+
+    centre.x = moments.m10 / moments.m00;
+    centre.y = moments.m01 / moments.m00;
+    return true;
+}
+
+// Draws an outline around each detected object.
+void draw_outlines(cv::Mat &image, const std::vector<std::vector<cv::Point>> &objects)
+{
+    cv::drawContours(image, objects, -1, OVERLAY_COLOUR, OUTLINE_THICKNESS);
+}
+
+// Writes the centre of mass coordinates onto the image, next to that point.
+void draw_centre_label(cv::Mat &image, const cv::Point2d &centre)
+{
+    char label[32];
+    snprintf(label, sizeof(label), "%.1f, %.1f", centre.x, centre.y);
+
+    cv::Point position(static_cast<int>(centre.x) + LABEL_OFFSET, static_cast<int>(centre.y));
+    cv::putText(image, label, position, cv::FONT_HERSHEY_SIMPLEX, LABEL_SCALE, OVERLAY_COLOUR);
+}
+
 int main()
 {
-    // Open the video camera.
-    std::string pipeline = "libcamerasrc"
-        " ! video/x-raw, width=800, height=600" // camera needs to capture at a higher resolution
-        " ! videoconvert"
-        " ! videoscale"
-        " ! video/x-raw, width=400, height=300" // can downsample the image after capturing
-        " ! videoflip method=rotate-180" // remove this line if the image is upside-down
-        " ! appsink drop=true max_buffers=2";
-    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
-    if(!cap.isOpened()) {
+    cv::VideoCapture camera(build_pipeline(), cv::CAP_GSTREAMER);
+    if (!camera.isOpened()) {
         printf("Could not open camera.\n");
         return 1;
     }
 
-    // Create the OpenCV window for the raw camera feed
-    cv::namedWindow("Camera", cv::WINDOW_AUTOSIZE);
+    DetectionParams params;
+    cv::namedWindow(CAMERA_WINDOW, cv::WINDOW_AUTOSIZE);
+    cv::namedWindow(THRESHOLD_WINDOW, cv::WINDOW_AUTOSIZE);
+    create_control_window(params);
 
-    // --- HSV threshold sliders (from Lab 6) ---
-    cv::namedWindow("Control", cv::WINDOW_AUTOSIZE);
-    int iLowH = 0;
-    int iHighH = 179;
+    // Declared outside the loop so the buffers are reused for every frame.
+    cv::Mat frame, hsv_frame, thresh_frame, display_frame;
+    std::vector<std::vector<cv::Point>> objects;
 
-    int iLowS = 0;
-    int iHighS = 255;
+    FrameRateMonitor frame_rate;
+    frame_rate.begin();
 
-    int iLowV = 0;
-    int iHighV = 255;
-
-    cv::createTrackbar("LowH", "Control", &iLowH, 179); // Hue (0 - 179)
-    cv::createTrackbar("HighH", "Control", &iHighH, 179);
-
-    cv::createTrackbar("LowS", "Control", &iLowS, 255); // Saturation (0 - 255)
-    cv::createTrackbar("HighS", "Control", &iHighS, 255);
-
-    cv::createTrackbar("LowV", "Control", &iLowV, 255); // Value (0 - 255)
-    cv::createTrackbar("HighV", "Control", &iHighV, 255);
-
-    // Kernel size for morphology, stored as "half size" (0-20) and converted
-    // to an odd full size below (getStructuringElement needs an odd number).
-    int iKernelSize = 3;
-    cv::createTrackbar("Kernel Size", "Control", &iKernelSize, 20);
-
-    cv::namedWindow("Thresholded", cv::WINDOW_AUTOSIZE);
-
-    cv::Mat frame, hsv_frame, thresh_frame;
-
-    // Measure the frame rate - initialise variables
-    int frame_id = 0;
-    timeval start, end;
-    gettimeofday(&start, NULL);
-
-    for(;;) {
-        if (!cap.read(frame)) {
+    for (;;) {
+        if (!camera.read(frame)) {
             printf("Could not read a frame.\n");
             break;
         }
 
-        // Threshold + morphology
-        cv::cvtColor(frame, hsv_frame, cv::COLOR_BGR2HSV);
+        threshold_image(frame, params, hsv_frame, thresh_frame);
+        cv::imshow(THRESHOLD_WINDOW, thresh_frame);
 
-        cv::inRange(hsv_frame, cv::Scalar(iLowH, iLowS, iLowV),
-                    cv::Scalar(iHighH, iHighS, iHighV), thresh_frame);
+        int largest = find_objects(thresh_frame, objects, params.min_area);
 
-        int kernelSize = iKernelSize * 2 + 1;
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE,
-                                                     cv::Size(kernelSize, kernelSize));
+        // Annotate a copy so that the captured frame itself stays unmarked.
+        frame.copyTo(display_frame);
+        draw_outlines(display_frame, objects);
 
-        cv::morphologyEx(thresh_frame, thresh_frame, cv::MORPH_OPEN, kernel);
-        cv::morphologyEx(thresh_frame, thresh_frame, cv::MORPH_CLOSE, kernel);
-
-        cv::imshow("Thresholded", thresh_frame);
-
-        // --- Extension: find contours, keep only the largest ---
-        // findContours needs a non-const copy of the mask to work on, and it
-        // modifies it in place - thresh_frame is already ours to use since we
-        // just displayed it above, so this is safe.
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(thresh_frame, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-        // Find the largest contour by area. Small contours are usually just
-        // leftover noise that survived the morphology step; the real object
-        // (the can) should be the biggest blob in the mask.
-        int largestIdx = -1;
-        double largestArea = 0.0;
-        for (size_t i = 0; i < contours.size(); i++) {
-            double area = cv::contourArea(contours[i]);
-            if (area > largestArea) {
-                largestArea = area;
-                largestIdx = (int)i;
-            }
+        // The centre of mass is taken from the largest object rather than the
+        // whole mask, so that any noise elsewhere in the frame cannot pull the
+        // reported position away from the object being tracked.
+        cv::Point2d centre;
+        if (largest >= 0 && centre_of_mass(objects[largest], centre)) {
+            printf("Centre of mass: (%.1f, %.1f)\n", centre.x, centre.y);
+            draw_centre_label(display_frame, centre);
         }
 
-        // Draw on a clone of the original frame so we don't permanently mark
-        // up the same Mat we're about to loop back and re-read next frame.
-        cv::Mat display_frame = frame.clone();
+        cv::imshow(CAMERA_WINDOW, display_frame);
+        frame_rate.tick();
 
-        if (largestIdx >= 0) {
-            // Draw the outline of just the largest contour, in white, 2px thick.
-            cv::drawContours(display_frame, contours, largestIdx,
-                              cv::Scalar(255, 255, 255), 2);
-
-            // Compute centre of mass from the largest contour only (rather than
-            // the whole mask), so leftover noise elsewhere in frame can't drag
-            // the centroid off target.
-            cv::Moments m = cv::moments(contours[largestIdx]);
-            if (m.m00 > 0) {
-                double cx = m.m10 / m.m00;
-                double cy = m.m01 / m.m00;
-
-                printf("Centre of mass: (%.1f, %.1f)\n", cx, cy);
-
-                // Write the coordinates onto the image near the centroid.
-                char text[64];
-                snprintf(text, sizeof(text), "(%.1f, %.1f)", cx, cy);
-                cv::putText(display_frame, text, cv::Point((int)cx + 10, (int)cy),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-            }
-        }
-
-        cv::imshow("Camera", display_frame);
-        // --- end Extension ---
-
-        cv::waitKey(1);
-
-        // Measure the frame rate
-        frame_id++;
-        if (frame_id >= 30) {
-            gettimeofday(&end, NULL);
-            double diff = end.tv_sec - start.tv_sec + (end.tv_usec - start.tv_usec)/1000000.0;
-            printf("30 frames in %f seconds = %f FPS\n", diff, 30/diff);
-            frame_id = 0;
-            gettimeofday(&start, NULL);
+        // The upper bits of the return value can carry modifier keys, so mask
+        // them off before comparing against the key we are looking for.
+        int key = cv::waitKey(1) & 0xFF;
+        if (key == 27 || key == 'q') { // Escape or q
+            break;
         }
     }
 
-    // Free the camera
-    cap.release();
+    camera.release();
+    cv::destroyAllWindows();
     return 0;
 }
